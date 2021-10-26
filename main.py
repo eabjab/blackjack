@@ -1,27 +1,20 @@
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
 import random
 
+# deprecated -- use deck_values instead to reduce branching factor of recursive probability calculations
 fullDeck = ["2", "2", "2", "2", "3", "3", "3", "3", "4", "4", "4", "4", "5", "5", "5", "5", "6", "6", "6", "6", "7",
             "7", "7", "7", "8", "8", "8", "8", "9", "9", "9", "9", "10", "10", "10", "10", "J", "J", "J", "J", "Q", "Q",
             "Q", "Q", "K", "K", "K", "K", "A", "A", "A", "A"]
 
-scoreTable = {
-    "2": 2,
-    "3": 3,
-    "4": 4,
-    "5": 5,
-    "6": 6,
-    "7": 7,
-    "8": 8,
-    "9": 9,
-    "10": 10,
-    "J": 10,
-    "Q": 10,
-    "K": 10,
-    "A": 1,
-}
+deck_values = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9,
+               9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+
+
+def countCards(card_list):
+    card_count = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0}
+    for card in card_list:
+        card_count[card] += 1
+
+    return card_count
 
 
 def scoreHand(hand):
@@ -29,39 +22,14 @@ def scoreHand(hand):
     has_ace = False
 
     for card in hand:
-        score += scoreTable[card]
-
-        if card == "A":
+        score += card
+        if card == 1:
             has_ace = True
 
     if has_ace and score <= 11:
         score += 10
 
     return score
-
-
-def countCards(cardList):
-    # reset count dict
-    card_counts = {
-        "2": 0,
-        "3": 0,
-        "4": 0,
-        "5": 0,
-        "6": 0,
-        "7": 0,
-        "8": 0,
-        "9": 0,
-        "10": 0,
-        "J": 0,
-        "Q": 0,
-        "K": 0,
-        "A": 0,
-    }
-
-    for card in cardList:
-        card_counts[card] += 1
-
-    return card_counts
 
 
 def getCardProb(card_counts):
@@ -73,15 +41,138 @@ def getCardProb(card_counts):
     return card_probabilities
 
 
+def getCardTuple(card_counts):
+    return tuple(card_counts.values())
+
+
+# d_hand should be a list with length 1 containing only dealer's face up card
+# using expected values instead of probability for now but switching is easy
+# TODO double check split calculation because values seem a bit high
+def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
+    p_score = scoreHand(p_hand)
+    d_score = scoreHand(d_hand)
+    p_hand_size = len(p_hand)
+    d_hand_size = len(d_hand)
+
+    if p_score > 21:  # player busts
+        return [-1] * 4
+    if d_score > 21:  # dealer busts
+        return [1] * 4
+    if (p_score == 21) and (p_hand_size == 2) and not split:  # player blackjack
+        return [1.5] * 4
+    if (d_score == 21) and (d_hand_size == 2):  # dealer blackjack
+        return [-1] * 4
+    if (not p_turn) and (d_score >= 17):  # neither busts, so we compare hands
+        if p_score > d_score:  # player wins
+            return [1] * 4
+        elif p_score < d_score:  # dealer wins
+            return [-1] * 4
+        else:  # push
+            return [0] * 4
+
+    total_expected_values = [0] * 4
+    card_prob = getCardProb(card_count)
+
+    card_tuple = getCardTuple(card_count)
+    # if we have already calculated expected value for a permutation of the current hand, don't recalculate it
+    if card_tuple in cached_hands:
+        return cached_hands[card_tuple]
+
+    for card in card_count:
+        if card_count[card] <= 0:
+            continue
+        # get probability of card being dealt
+        prob = card_prob[card]
+
+        expected_values = [0] * 4  # will always be overridden
+        if p_turn:
+            # stand
+            stand_expected_value = -1 * prob
+            # if player has 0% chance to bust, don't even consider standing
+            if p_score > 11:
+                stand_expected_value = prob * max(getDecision(p_hand, d_hand, card_count, dict(), False, split))
+                # if split and first card is ace
+
+            # hit
+            hit_expected_value = -1 * prob
+            double_ev = -2 * prob
+            if p_score < 21:
+                card_copy = card_count.copy()
+                p_copy = p_hand[:]
+
+                p_copy.append(card)
+                card_copy[card] -= 1
+                hit_expected_value = prob * max(getDecision(p_copy, d_hand, card_copy, cached_hands, True, split))
+                # double down
+                if p_hand_size == 2 and not split:
+                    double_ev = 2 * prob * max(getDecision(p_copy, d_hand, card_copy, dict(), False, split))
+
+            # split
+            split_ev = -2 * prob
+            if not split and p_hand_size == 2 and p_hand[0] == p_hand[1]:
+                split_ev = 0
+                card_copy = card_count.copy()
+                p_left = p_hand[:1]
+                p_right = p_hand[1:]
+                left_cache = dict()
+                right_cache = dict()
+
+                aces = (p_left[0] == 1) and (p_right[0] == 1)
+
+                p_left.append(card)
+                card_copy[card] -= 1
+                split_card_prob = getCardProb(card_copy)
+                # first two cards after split are dealt immediately so take all combinations into account
+                for right_card in card_copy:
+                    if card_copy[right_card] <= 0:
+                        continue
+
+                    split_prob = split_card_prob[right_card]
+
+                    split_copy = card_count.copy()
+                    p_right_copy = p_right[:]
+
+                    split_copy[right_card] -= 1
+                    p_right_copy.append(right_card)
+
+                    # if split aces, clear cache for dealers turn
+                    if aces:
+                        left_cache = dict()
+                        right_cache = dict()
+
+                    left_ev = prob * split_prob * max(
+                        getDecision(p_left, d_hand, split_copy, left_cache, not aces, True))
+                    right_ev = prob * split_prob * max(
+                        getDecision(p_right, d_hand, split_copy, right_cache, not aces, True))
+                    split_ev += (left_ev + right_ev)
+
+            expected_values = list([stand_expected_value, hit_expected_value, double_ev, split_ev])
+
+        else:
+            d_copy = d_hand[:]
+            card_copy = card_count.copy()
+            if d_hand_size == 1:  # check all possible dealer face down cards
+                d_copy.append(card)
+                card_copy[card] -= 1
+                expected_values = [val * prob for val in getDecision(p_hand, d_copy, card_copy, dict(), True, split)]
+            elif d_score < 17:
+                d_copy.append(card)
+                card_copy[card] -= 1
+                expected_values = [val * prob for val in
+                                   getDecision(p_hand, d_copy, card_copy, cached_hands, False, split)]
+
+        total_expected_values = [a + b for a, b in zip(total_expected_values, expected_values)]
+
+    cached_hands[card_tuple] = total_expected_values
+    return total_expected_values
+
+
 # TODO ideas to go faster
-# reduce branching factor
 # multi processing
-# cache results
 # simulate results
-# maybe pass running probability up thru recursion to determine when to simulate instead of calculate
 
 # TODO expected values for blackjack/double down/split cases
-# initial call should be recursivePlay([], [], card_count, False) as of now
+# initial call should be getWinProbability([], [], card_count, False) as of now
 def getWinProbability(p_hand, d_hand, card_count, p_turn):
     p_score = scoreHand(p_hand)
     d_score = scoreHand(d_hand)
@@ -91,9 +182,9 @@ def getWinProbability(p_hand, d_hand, card_count, p_turn):
     if d_score > 21:  # dealer busts
         return 1
     # TODO implement something to determine if hand is a split hand and therefore not blackjack
-    if (len(p_hand) == 2) and (p_score == 21):  # player blackjack
+    if (p_score == 21) and (len(p_hand) == 2):  # player blackjack
         return 1
-    if (len(d_hand) == 2) and (len(p_hand) == 2) and (d_score == 21):  # dealer blackjack
+    if (d_score == 21) and (len(d_hand) == 2) and (len(p_hand) == 2):  # dealer blackjack
         return 0
     if (not p_turn) and (d_score >= 17):  # neither busts, so we compare hands
         if p_score > d_score:  # player wins
@@ -172,7 +263,7 @@ class Shoe:
     def __init__(self, numDecks):
         self.card_list = []
         for i in range(numDecks):
-            self.card_list += fullDeck
+            self.card_list += deck_values
 
         self.card_counts = countCards(self.card_list)
         self.card_probabilities = getCardProb(self.card_counts)
@@ -182,6 +273,11 @@ class Shoe:
 
     def draw(self):
         card = self.card_list.pop()
+        self.card_counts[card] -= 1
+        return card
+
+    def drawCard(self, card):
+        self.card_list.remove(card)
         self.card_counts[card] -= 1
         return card
 
@@ -301,13 +397,15 @@ class Game:
 
 
 if __name__ == '__main__':
-    s1 = Shoe(1)
-    player_hand = []
-    dealer_hand = []
+    s1 = Shoe(6)
+    s1.shuffle()
+    dealer_hand = [s1.drawCard(6)]
+    player_hand = [s1.drawCard(9), s1.drawCard(9)]
+    cards = s1.card_counts
+    print(cards)
 
-    win_prob = getWinProbability(player_hand, dealer_hand, s1.card_counts, False)
-    print(win_prob)
-    print(player_hand)
     print(dealer_hand)
+    print(player_hand)
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    decision_vector = getDecision(player_hand, dealer_hand, cards, dict(), False, False)
+    print(decision_vector)
