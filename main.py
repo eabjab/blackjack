@@ -1,4 +1,6 @@
 import random
+import pickle
+import time
 
 # deprecated -- use deck_values instead to reduce branching factor of recursive probability calculations
 fullDeck = ["2", "2", "2", "2", "3", "3", "3", "3", "4", "4", "4", "4", "5", "5", "5", "5", "6", "6", "6", "6", "7",
@@ -32,6 +34,15 @@ def scoreHand(hand):
     return score
 
 
+# TODO implement tuple score structure (score, has_ace) instead of player hand for caching
+# or alternate struct with similar effect
+def updateScore(score_tuple, card_val):
+    new_score = score_tuple[0] + card_val
+    if score_tuple[1] and new_score > 21:
+        return tuple((new_score - 10, False))
+    return tuple((new_score, score_tuple[1]))
+
+
 def getCardProb(card_counts):
     card_probabilities = card_counts.copy()
     total = sum(card_counts.values())
@@ -41,14 +52,42 @@ def getCardProb(card_counts):
     return card_probabilities
 
 
-def getCardTuple(card_counts):
-    return tuple(card_counts.values())
+# TODO figure out if copying hands is necessary
+def getCacheTuple(card_counts, p_hand, d_hand):
+    p_copy = p_hand[:]
+    d_copy = d_hand[:]
+    p_copy.sort()
+    d_copy.sort()
+    cache_tuple = tuple((tuple(card_counts.values()), tuple(p_copy), tuple(d_copy)))
+
+    return cache_tuple
+
+
+def addToCache(cache, cache_tuple, ev):
+    cache[cache_tuple] = tuple(ev)
+    return -1
+
+
+def saveCache(cache, path):
+    pickle.dump(cache, open(path, "wb"))
+
+
+def loadCache(path):
+    cache = pickle.load(open(path, "rb"))
+    return cache
 
 
 # d_hand should be a list with length 1 containing only dealer's face up card
 # using expected values instead of probability for now but switching is easy
 # TODO double check split calculation because values seem a bit high
-def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
+def getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, p_turn, split):
+    cache_tuple = getCacheTuple(card_count, p_hand, d_hand)
+    # if we have already calculated expected value for a permutation of the current hand, don't recalculate it
+    if cache_tuple in perm_cache:
+        return perm_cache[cache_tuple]
+    elif cache_tuple in temp_cache:
+        return temp_cache[cache_tuple]
+
     p_score = scoreHand(p_hand)
     d_score = scoreHand(d_hand)
     p_hand_size = len(p_hand)
@@ -73,11 +112,6 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
     total_expected_values = [0] * 4
     card_prob = getCardProb(card_count)
 
-    card_tuple = getCardTuple(card_count)
-    # if we have already calculated expected value for a permutation of the current hand, don't recalculate it
-    if card_tuple in cached_hands:
-        return cached_hands[card_tuple]
-
     for card in card_count:
         if card_count[card] <= 0:
             continue
@@ -90,7 +124,8 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
             stand_expected_value = -1 * prob
             # if player has 0% chance to bust, don't even consider standing
             if p_score > 11:
-                stand_expected_value = prob * max(getDecision(p_hand, d_hand, card_count, dict(), False, split))
+                stand_expected_value = prob * max(
+                    getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, False, split))
                 # if split and first card is ace
 
             # hit
@@ -102,10 +137,12 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
 
                 p_copy.append(card)
                 card_copy[card] -= 1
-                hit_expected_value = prob * max(getDecision(p_copy, d_hand, card_copy, cached_hands, True, split))
+                hit_expected_value = prob * max(
+                    getDecision(p_copy, d_hand, card_copy, perm_cache, temp_cache, True, split))
                 # double down
                 if p_hand_size == 2 and not split:
-                    double_ev = 2 * prob * max(getDecision(p_copy, d_hand, card_copy, dict(), False, split))
+                    double_ev = 2 * prob * max(
+                        getDecision(p_copy, d_hand, card_copy, perm_cache, temp_cache, False, split))
 
             # split
             split_ev = -2 * prob
@@ -114,8 +151,6 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
                 card_copy = card_count.copy()
                 p_left = p_hand[:1]
                 p_right = p_hand[1:]
-                left_cache = dict()
-                right_cache = dict()
 
                 aces = (p_left[0] == 1) and (p_right[0] == 1)
 
@@ -135,15 +170,10 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
                     split_copy[right_card] -= 1
                     p_right_copy.append(right_card)
 
-                    # if split aces, clear cache for dealers turn
-                    if aces:
-                        left_cache = dict()
-                        right_cache = dict()
-
                     left_ev = prob * split_prob * max(
-                        getDecision(p_left, d_hand, split_copy, left_cache, not aces, True))
+                        getDecision(p_left, d_hand, split_copy, perm_cache, temp_cache, not aces, True))
                     right_ev = prob * split_prob * max(
-                        getDecision(p_right, d_hand, split_copy, right_cache, not aces, True))
+                        getDecision(p_right, d_hand, split_copy, perm_cache, temp_cache, not aces, True))
                     split_ev += (left_ev + right_ev)
 
             expected_values = list([stand_expected_value, hit_expected_value, double_ev, split_ev])
@@ -154,16 +184,21 @@ def getDecision(p_hand, d_hand, card_count, cached_hands, p_turn, split):
             if d_hand_size == 1:  # check all possible dealer face down cards
                 d_copy.append(card)
                 card_copy[card] -= 1
-                expected_values = [val * prob for val in getDecision(p_hand, d_copy, card_copy, dict(), True, split)]
+                expected_values = [val * prob for val in
+                                   getDecision(p_hand, d_copy, card_copy, perm_cache, temp_cache, True, split)]
             elif d_score < 17:
                 d_copy.append(card)
                 card_copy[card] -= 1
                 expected_values = [val * prob for val in
-                                   getDecision(p_hand, d_copy, card_copy, cached_hands, False, split)]
+                                   getDecision(p_hand, d_copy, card_copy, perm_cache, temp_cache, False, split)]
 
         total_expected_values = [a + b for a, b in zip(total_expected_values, expected_values)]
 
-    cached_hands[card_tuple] = total_expected_values
+    if (p_hand_size < 4) and (d_hand_size == 1) and (cache_tuple not in perm_cache):
+        addToCache(perm_cache, cache_tuple, total_expected_values)
+    elif cache_tuple not in temp_cache:
+        addToCache(temp_cache, cache_tuple, total_expected_values)
+
     return total_expected_values
 
 
@@ -259,12 +294,34 @@ def getWinProbability(p_hand, d_hand, card_count, p_turn):
     return total_prob
 
 
+def buildSplitCache(cache, path, shoe):
+    original_card_list = shoe.card_list[:]
+    for d_card_val in range(1, 11, 1):
+        shoe.setCardList(original_card_list)
+        d_hand = [shoe.drawCard(d_card_val)]
+        updated_card_list = shoe.card_list[:]
+        for p_card_val in range(1, 11, 1):
+            start = time.time()
+            shoe.setCardList(updated_card_list)
+            p_hand = [shoe.drawCard(p_card_val), shoe.drawCard(p_card_val)]
+            decision_evs = getDecision(p_hand, d_hand, shoe.card_counts, cache, dict(), False, False)
+            print(d_hand, p_hand, decision_evs)
+            saveCache(cache, path)
+            end = time.time()
+            print("Time: ", end - start)
+
+
 class Shoe:
     def __init__(self, numDecks):
         self.card_list = []
         for i in range(numDecks):
             self.card_list += deck_values
 
+        self.card_counts = countCards(self.card_list)
+        self.card_probabilities = getCardProb(self.card_counts)
+
+    def setCardList(self, card_list):
+        self.card_list = card_list[:]
         self.card_counts = countCards(self.card_list)
         self.card_probabilities = getCardProb(self.card_counts)
 
@@ -397,15 +454,19 @@ class Game:
 
 
 if __name__ == '__main__':
-    s1 = Shoe(6)
-    s1.shuffle()
-    dealer_hand = [s1.drawCard(6)]
-    player_hand = [s1.drawCard(9), s1.drawCard(9)]
-    cards = s1.card_counts
-    print(cards)
+    # s1 = Shoe(6)
+    # s1.shuffle()
+    # dealer_hand = [s1.drawCard(6)]
+    # player_hand = [s1.drawCard(8), s1.drawCard(3)]
+    # cards = s1.card_counts
+    # print(cards)
+    cache_path = "E:\BlackjackCache\ev_cache.p"
 
-    print(dealer_hand)
-    print(player_hand)
-
-    decision_vector = getDecision(player_hand, dealer_hand, cards, dict(), False, False)
-    print(decision_vector)
+    main_cache = dict()
+    full_shoe = Shoe(8)
+    start_time = time.time()
+    buildSplitCache(main_cache, cache_path, full_shoe)
+    # decision_vector = getDecision(player_hand, dealer_hand, cards, big_cache, False, False)
+    end_time = time.time()
+    print(end_time - start_time)
+    saveCache(main_cache, cache_path)
