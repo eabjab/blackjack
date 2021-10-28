@@ -19,6 +19,7 @@ def countCards(card_list):
     return card_count
 
 
+# deprecated, use score tuple instead
 def scoreHand(hand):
     score = 0
     has_ace = False
@@ -34,13 +35,45 @@ def scoreHand(hand):
     return score
 
 
-# TODO implement tuple score structure (score, has_ace) instead of player hand for caching
-# or alternate struct with similar effect
-def updateScore(score_tuple, card_val):
+# return a tuple with the form (score, soft_ace, can_split, two_cards) for more efficient caching
+# whether the hand is initial two cards is necessary to check for blackjack, split, and double decisions,
+# and simply using length would reduce caching efficiency significantly
+def handToScore(hand, is_player):
+    score = 0
+    has_ace = False
+    soft_ace = False
+    initial_hand = (len(hand) == 2)
+    can_split = is_player and initial_hand and (hand[0] == hand[1])
+
+    for card in hand:
+        score += card
+        if card == 1:
+            has_ace = True
+    if has_ace and score <= 11:
+        score += 10
+        soft_ace = True
+
+    return tuple((score, soft_ace, can_split, initial_hand))
+
+
+# TODO implement tuple score structure (score, soft_ace, can_split, initial_hand) instead of player hand for caching
+# initial_hand should only be true when "dealing" dealers face down card after player stands
+def updateScore(score_tuple, card_val, initial_hand):
     new_score = score_tuple[0] + card_val
+    # TODO check if it's safe to always set can_split to false
     if score_tuple[1] and new_score > 21:
-        return tuple((new_score - 10, False))
-    return tuple((new_score, score_tuple[1]))
+        return tuple((new_score - 10, False, False, initial_hand))
+    elif card_val == 1 and not score_tuple[1] and new_score <= 11:
+        return tuple((new_score + 10, True, False, initial_hand))
+
+    return tuple((new_score, score_tuple[1], False, initial_hand))
+
+
+def splitScore(score_tuple):
+    if score_tuple[1]:  # if splitting aces
+        return tuple((11, True, False, False))
+    else:  # if splitting any other cards
+        return tuple((int(score_tuple[0] / 2), False, False, False))
 
 
 def getCardProb(card_counts):
@@ -52,20 +85,14 @@ def getCardProb(card_counts):
     return card_probabilities
 
 
-# TODO figure out if copying hands is necessary
-def getCacheTuple(card_counts, p_hand, d_hand):
-    p_copy = p_hand[:]
-    d_copy = d_hand[:]
-    p_copy.sort()
-    d_copy.sort()
-    cache_tuple = tuple((tuple(card_counts.values()), tuple(p_copy), tuple(d_copy)))
-
+def getCacheTuple(card_counts, p_score, d_score):
+    cache_tuple = tuple((tuple(card_counts.values()), p_score, d_score))
     return cache_tuple
 
 
 def addToCache(cache, cache_tuple, ev):
     cache[cache_tuple] = tuple(ev)
-    return -1
+    return True
 
 
 def saveCache(cache, path):
@@ -79,38 +106,44 @@ def loadCache(path):
 
 # d_hand should be a list with length 1 containing only dealer's face up card
 # using expected values instead of probability for now but switching is easy
-# TODO double check split calculation because values seem a bit high
-def getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, p_turn, split):
-    cache_tuple = getCacheTuple(card_count, p_hand, d_hand)
+# TODO fix issues with splitting and aces (completely broken)
+# dealer starting with ace seems to cause a ton of issues
+def getDecision(p_score, d_score, card_count, perm_cache, temp_cache, p_turn, split, initial_call):
+    # base cases
+    if p_score[0] > 21:
+        return [-1] * 4  # player busts
+    if d_score[0] > 21:
+        return [1] * 4  # dealer busts
+    # if (p_score[3] and p_score[0] == 21) and (d_score[3] and d_score[0] == 21):
+    #     return [0] * 4  # both player and dealer have blackjack (push)
+    if p_score[0] == 21 and p_score[3] and not split:
+        return [1.5] * 4  # player blackjack
+    # if not p_turn and d_score[0] == 21 and d_score[3]:
+    #     return [-1] * 4  # dealer blackjack
+    if (not p_turn) and (d_score[0] >= 17):
+        # compare hands to determine winner
+        if p_score[0] > d_score[0]:
+            return [1] * 4  # player wins
+        elif p_score[0] < d_score[0]:
+            return [-1] * 4  # dealer wins
+        else:
+            return [0] * 4  # push
+
     # if we have already calculated expected value for a permutation of the current hand, don't recalculate it
+    cache_tuple = getCacheTuple(card_count, p_score, d_score)
     if cache_tuple in perm_cache:
         return perm_cache[cache_tuple]
     elif cache_tuple in temp_cache:
         return temp_cache[cache_tuple]
 
-    p_score = scoreHand(p_hand)
-    d_score = scoreHand(d_hand)
-    p_hand_size = len(p_hand)
-    d_hand_size = len(d_hand)
-
-    if p_score > 21:  # player busts
-        return [-1] * 4
-    if d_score > 21:  # dealer busts
-        return [1] * 4
-    if (p_score == 21) and (p_hand_size == 2) and not split:  # player blackjack
-        return [1.5] * 4
-    if (d_score == 21) and (d_hand_size == 2):  # dealer blackjack
-        return [-1] * 4
-    if (not p_turn) and (d_score >= 17):  # neither busts, so we compare hands
-        if p_score > d_score:  # player wins
-            return [1] * 4
-        elif p_score < d_score:  # dealer wins
-            return [-1] * 4
-        else:  # push
-            return [0] * 4
-
     total_expected_values = [0] * 4
     card_prob = getCardProb(card_count)
+
+    stand_ev = -1
+    # if player has 0% chance to bust, don't even consider standing
+    if p_turn:
+        # stand
+        stand_ev = max(getDecision(p_score, d_score, card_count, perm_cache, temp_cache, False, split, False))
 
     for card in card_count:
         if card_count[card] <= 0:
@@ -120,42 +153,32 @@ def getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, p_turn, spli
 
         expected_values = [0] * 4  # will always be overridden
         if p_turn:
-            # stand
-            stand_expected_value = -1 * prob
-            # if player has 0% chance to bust, don't even consider standing
-            if p_score > 11:
-                stand_expected_value = prob * max(
-                    getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, False, split))
-                # if split and first card is ace
-
             # hit
-            hit_expected_value = -1 * prob
+            hit_ev = -1 * prob
             double_ev = -2 * prob
-            if p_score < 21:
+            if p_score[0] < 21:
                 card_copy = card_count.copy()
-                p_copy = p_hand[:]
-
-                p_copy.append(card)
                 card_copy[card] -= 1
-                hit_expected_value = prob * max(
-                    getDecision(p_copy, d_hand, card_copy, perm_cache, temp_cache, True, split))
+                p_hit_score = updateScore(p_score, card, False)
+
+                hit_ev = prob * max(
+                    getDecision(p_hit_score, d_score, card_copy, perm_cache, temp_cache, True, split, False))
                 # double down
-                if p_hand_size == 2 and not split:
+                if p_score[3] and not split:
                     double_ev = 2 * prob * max(
-                        getDecision(p_copy, d_hand, card_copy, perm_cache, temp_cache, False, split))
+                        getDecision(p_hit_score, d_score, card_copy, perm_cache, temp_cache, False, False, False))
 
             # split
             split_ev = -2 * prob
-            if not split and p_hand_size == 2 and p_hand[0] == p_hand[1]:
+            if not split and p_score[2] and p_score[3]:
                 split_ev = 0
                 card_copy = card_count.copy()
-                p_left = p_hand[:1]
-                p_right = p_hand[1:]
-
-                aces = (p_left[0] == 1) and (p_right[0] == 1)
-
-                p_left.append(card)
                 card_copy[card] -= 1
+                split_base_score = splitScore(p_score)
+                split_aces = split_base_score[1]
+                # TODO double check initial hand should be true
+                p_left_score = updateScore(split_base_score, card, True)
+
                 split_card_prob = getCardProb(card_copy)
                 # first two cards after split are dealt immediately so take all combinations into account
                 for right_card in card_copy:
@@ -164,37 +187,34 @@ def getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, p_turn, spli
 
                     split_prob = split_card_prob[right_card]
 
-                    split_copy = card_count.copy()
-                    p_right_copy = p_right[:]
-
+                    split_copy = card_copy.copy()
                     split_copy[right_card] -= 1
-                    p_right_copy.append(right_card)
+                    p_right_score = updateScore(split_base_score, right_card, True)
 
                     left_ev = prob * split_prob * max(
-                        getDecision(p_left, d_hand, split_copy, perm_cache, temp_cache, not aces, True))
+                        getDecision(p_left_score, d_score, split_copy, perm_cache, temp_cache, not split_aces, True,
+                                    False))
                     right_ev = prob * split_prob * max(
-                        getDecision(p_right, d_hand, split_copy, perm_cache, temp_cache, not aces, True))
+                        getDecision(p_right_score, d_score, split_copy, perm_cache, temp_cache, not split_aces, True,
+                                    False))
+
                     split_ev += (left_ev + right_ev)
 
-            expected_values = list([stand_expected_value, hit_expected_value, double_ev, split_ev])
+            expected_values = list([stand_ev * prob, hit_ev, double_ev, split_ev])
 
         else:
-            d_copy = d_hand[:]
             card_copy = card_count.copy()
-            if d_hand_size == 1:  # check all possible dealer face down cards
-                d_copy.append(card)
-                card_copy[card] -= 1
-                expected_values = [val * prob for val in
-                                   getDecision(p_hand, d_copy, card_copy, perm_cache, temp_cache, True, split)]
-            elif d_score < 17:
-                d_copy.append(card)
-                card_copy[card] -= 1
-                expected_values = [val * prob for val in
-                                   getDecision(p_hand, d_copy, card_copy, perm_cache, temp_cache, False, split)]
+            card_copy[card] -= 1
+
+            d_hit_score = updateScore(d_score, card, initial_call)
+
+            expected_values = [val * prob for val in
+                               getDecision(p_score, d_hit_score, card_copy, perm_cache, temp_cache, initial_call, split,
+                                           False)]
 
         total_expected_values = [a + b for a, b in zip(total_expected_values, expected_values)]
 
-    if (p_hand_size < 4) and (d_hand_size == 1) and (cache_tuple not in perm_cache):
+    if initial_call and (cache_tuple not in perm_cache):
         addToCache(perm_cache, cache_tuple, total_expected_values)
     elif cache_tuple not in temp_cache:
         addToCache(temp_cache, cache_tuple, total_expected_values)
@@ -202,12 +222,7 @@ def getDecision(p_hand, d_hand, card_count, perm_cache, temp_cache, p_turn, spli
     return total_expected_values
 
 
-# TODO ideas to go faster
-# multi processing
-# simulate results
-
-# TODO expected values for blackjack/double down/split cases
-# initial call should be getWinProbability([], [], card_count, False) as of now
+# deprecated but keeping around just in case
 def getWinProbability(p_hand, d_hand, card_count, p_turn):
     p_score = scoreHand(p_hand)
     d_score = scoreHand(d_hand)
@@ -299,13 +314,17 @@ def buildSplitCache(cache, path, shoe):
     for d_card_val in range(1, 11, 1):
         shoe.setCardList(original_card_list)
         d_hand = [shoe.drawCard(d_card_val)]
+        d_score = handToScore(d_hand, False)
         updated_card_list = shoe.card_list[:]
         for p_card_val in range(1, 11, 1):
             start = time.time()
             shoe.setCardList(updated_card_list)
             p_hand = [shoe.drawCard(p_card_val), shoe.drawCard(p_card_val)]
-            decision_evs = getDecision(p_hand, d_hand, shoe.card_counts, cache, dict(), False, False)
-            print(d_hand, p_hand, decision_evs)
+            p_score = handToScore(p_hand, True)
+            print("Dealer:", d_hand, d_score)
+            print("Player:", p_hand, p_score)
+            decision_evs = getDecision(p_score, d_score, shoe.card_counts, cache, dict(), False, False, True)
+            print("Expected Values:", decision_evs)
             saveCache(cache, path)
             end = time.time()
             print("Time: ", end - start)
@@ -457,16 +476,21 @@ if __name__ == '__main__':
     # s1 = Shoe(6)
     # s1.shuffle()
     # dealer_hand = [s1.drawCard(6)]
-    # player_hand = [s1.drawCard(8), s1.drawCard(3)]
+    # player_hand = [s1.drawCard(9), s1.drawCard(9)]
     # cards = s1.card_counts
     # print(cards)
+    # dealer_score = handToScore(dealer_hand, False)
+    # print(dealer_score)
+    # player_score = handToScore(player_hand, True)
+    # print(player_score)
+    # print(getCacheTuple(cards, player_score, dealer_score))
     cache_path = "E:\BlackjackCache\ev_cache.p"
-
-    main_cache = dict()
+    # main_cache = dict()
+    main_cache = loadCache(cache_path)
     full_shoe = Shoe(8)
     start_time = time.time()
     buildSplitCache(main_cache, cache_path, full_shoe)
-    # decision_vector = getDecision(player_hand, dealer_hand, cards, big_cache, False, False)
+    # print(getDecision(player_score, dealer_score, cards, main_cache, dict(), False, False, True))
     end_time = time.time()
-    print(end_time - start_time)
+    print("Time:", end_time - start_time)
     saveCache(main_cache, cache_path)
